@@ -1,5 +1,10 @@
 #include <assert.h>
 
+#define LENGTH(array) ((sizeof(array)) / sizeof(*(array)))
+
+#define likely(condition)   __builtin_expect(!!(condition), 1)
+#define unlikely(condition) __builtin_expect(!!(condition), 0)
+
 enum gate_id_t {
     GATE_NONE,
     GATE_NOT,

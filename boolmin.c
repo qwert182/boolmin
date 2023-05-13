@@ -14,10 +14,16 @@ static struct options_t {
 struct input_t {
     int gate_idx; // index in 'gatelist'
     int connection; // index in 'outputs'
+    int visited_by_route; // index in 'inputs' (routes start from inputs[0..circuit_inputs_number-1])
 };
 
 struct output_t {
     int gate_idx; // index in 'gatelist'
+};
+
+struct gatelist_t {
+    enum gate_id_t id;
+    int io_indices[5];
 };
 
 static void reset_circuit_inputs(struct input_t *inputs, int circuit_inputs_number, int circuit_outputs_number) {
@@ -31,6 +37,40 @@ static void reset_circuit_inputs(struct input_t *inputs, int circuit_inputs_numb
     }
 }
 
+struct queue_t {
+    int head, tail;
+    int nodes[30];
+};
+
+static void queue_reset(struct queue_t *queue) {
+    queue->head = 0;
+    queue->tail = 0;
+}
+
+static int queue_get_size(struct queue_t *queue) {
+    if (queue->head <= queue->tail)
+        return queue->tail - queue->head;
+    else
+        return LENGTH(queue->nodes) - queue->head + queue->tail;
+}
+
+static void queue_push(struct queue_t *queue, int value) {
+    assert(queue_get_size(queue) < LENGTH(queue->nodes) - 1);
+    queue->nodes[queue->tail++] = value;
+    if (unlikely(queue->tail == LENGTH(queue->nodes)))
+        queue->tail = 0;
+}
+
+static int queue_pop(struct queue_t *queue, int *value_out) {
+    if (queue_get_size(queue) > 0) {
+        *value_out = queue->nodes[queue->head++];
+        if (unlikely(queue->head == LENGTH(queue->nodes)))
+            queue->head = 0;
+        return 1;
+    }
+    return 0;
+}
+
 static void do_devlist(enum device_id_t *devlist, int devices_number, int circuit_inputs_number, int circuit_outputs_number) {
     int gateset[GATE_ID_NUMBER];
     memset(gateset, 0, sizeof gateset);
@@ -40,14 +80,14 @@ static void do_devlist(enum device_id_t *devlist, int devices_number, int circui
             ++gateset[devices[devlist[i]].gates[j]];
             ++gates_number;
         }
-    enum gate_id_t gatelist[gates_number];
+    struct gatelist_t gatelist[gates_number];
+    memset(gatelist, 0, (unsigned)gates_number * sizeof *gatelist);
 
     int inputs_number = circuit_inputs_number;
     int outputs_number = circuit_outputs_number;
-    memset(gatelist, 0, (unsigned)gates_number * sizeof *gatelist);
     for (int i = 0, gate_idx = 0; i < GATE_ID_NUMBER; ++i)
         for (int j = 0; j < gateset[i]; ++j) {
-            gatelist[gate_idx++] = i;
+            gatelist[gate_idx++].id = i;
             inputs_number += gates[i].inputs_number;
             outputs_number += gates[i].outputs_number;
         }
@@ -61,25 +101,27 @@ static void do_devlist(enum device_id_t *devlist, int devices_number, int circui
     memset(inputs, -1, (unsigned)(inputs_number + 1) * sizeof *inputs);
     memset(outputs, -1, (unsigned)outputs_number * sizeof *outputs);
     for (int i = 0, input_idx = circuit_inputs_number, output_idx = circuit_outputs_number; i < gates_number; ++i) {
-        for (int j = 0; j < gates[gatelist[i]].inputs_number; ++j)
+        assert(LENGTH(gatelist[i].io_indices) >= gates[gatelist[i].id].inputs_number + gates[gatelist[i].id].outputs_number);
+        int io_idx = 0;
+        for (int j = 0; j < gates[gatelist[i].id].inputs_number; ++j) {
+            gatelist[i].io_indices[io_idx++] = input_idx;
             inputs[input_idx++].gate_idx = i;
-        for (int j = 0; j < gates[gatelist[i]].outputs_number; ++j)
+        }
+        for (int j = 0; j < gates[gatelist[i].id].outputs_number; ++j) {
+            gatelist[i].io_indices[io_idx++] = output_idx;
             outputs[output_idx++].gate_idx = i;
+        }
     }
 
     for (int i = 0; i < gates_number; ++i) {
-        printf("gate[%d] = %s: ", i, gates[gatelist[i]].name);
+        printf("gate[%d] = %s: ", i, gates[gatelist[i].id].name);
         printf("i={");
-        int first = 1;
-        for (int j = 0; j < inputs_number; ++j)
-            if (inputs[j].gate_idx == i)
-                printf(first ? "%d" : ", %d", j), first = 0;
+        for (int j = 0; j < gates[gatelist[i].id].inputs_number; ++j)
+            printf(j ? ", %d" : "%d", gatelist[i].io_indices[j]);
         printf("}, ");
         printf("o={");
-        first = 1;
-        for (int j = 0; j < outputs_number; ++j)
-            if (outputs[j].gate_idx == i)
-                printf(first ? "%d" : ", %d", j), first = 0;
+        for (int j = 0; j < gates[gatelist[i].id].outputs_number; ++j)
+            printf(j ? ", %d" : "%d", gatelist[i].io_indices[gates[gatelist[i].id].inputs_number + j]);
         printf("}");
         printf("\n");
     }
@@ -108,10 +150,10 @@ static void do_devlist(enum device_id_t *devlist, int devices_number, int circui
         total_graphs_number_computed *= power(outputs_number, inputs_number - circuit_inputs_number);
     else
         for (int i = 0; i < gates_number; ++i)
-            if (gates[gatelist[i]].is_symmetric)
-                total_graphs_number_computed *= multiset_number(outputs_number, gates[gatelist[i]].inputs_number);
+            if (gates[gatelist[i].id].is_symmetric)
+                total_graphs_number_computed *= multiset_number(outputs_number, gates[gatelist[i].id].inputs_number);
             else
-                total_graphs_number_computed *= power(outputs_number, gates[gatelist[i]].inputs_number);
+                total_graphs_number_computed *= power(outputs_number, gates[gatelist[i].id].inputs_number);
 
     long total_graphs_number = 0;
     for (;;) {
@@ -119,6 +161,87 @@ static void do_devlist(enum device_id_t *devlist, int devices_number, int circui
         for (int i = 0; i < inputs_number; ++i)
             printf(i ? " %d" : "%d", inputs[i].connection);
         printf("}\n");
+
+        {
+            FILE *f = fopen("/tmp/graph.dot", "w");
+            fprintf(f, "digraph G {\n");
+            for (int i = 0; i < circuit_inputs_number; ++i)
+                fprintf(f, "  i%d [shape=Msquare];\n", i);
+            for (int i = 0; i < circuit_outputs_number; ++i)
+                fprintf(f, "  o%d [shape=doublecircle];\n", i);
+            for (int i = 0; i < gates_number; ++i) {
+                fprintf(f, "  subgraph cluster_0g%d {\n", i);
+                fprintf(f, "    label = \"g%d\";\n", i);
+                fprintf(f, "    labeljust = l;\n");
+                fprintf(f, "    style = filled;\n");
+                fprintf(f, "    color = lightgrey;\n");
+                fprintf(f, "    node [style=filled, fillcolor=white];\n");
+                fprintf(f, "    edge [style=invis];\n");
+                //for (int j = 0; j < inputs_number; ++j)
+                //    if (inputs[j].gate_idx == i)
+                //        fprintf(f, "    i%d;\n", j);
+                //for (int j = 0; j < outputs_number; ++j)
+                //    if (outputs[j].gate_idx == i) {
+                //        fprintf(f, "    o%d;\n", j);
+                //        for (int k = 0; k < inputs_number; ++k)
+                //            if (inputs[k].gate_idx == i)
+                //                fprintf(f, "    i%d -> o%d;\n", k, j);
+                //    }
+                for (int j = 0; j < gates[gatelist[i].id].inputs_number; ++j)
+                    fprintf(f, "    i%d;\n", gatelist[i].io_indices[j]);
+                for (int j = 0; j < gates[gatelist[i].id].outputs_number; ++j)
+                    for (int k = 0; k < gates[gatelist[i].id].inputs_number; ++k)
+                        fprintf(f, "    i%d -> o%d;\n", gatelist[i].io_indices[k], gatelist[i].io_indices[gates[gatelist[i].id].inputs_number + j]);
+                fprintf(f, "  }\n");
+            }
+            for (int i = circuit_outputs_number; i < outputs_number; ++i)
+                fprintf(f, "  o%d;\n", i);
+            for (int i = 0; i < inputs_number; ++i)
+                fprintf(f, "  o%d -> i%d;\n", inputs[i].connection, i);
+            fprintf(f, "}\n");
+            fclose(f);
+        }
+
+        {
+            for (int i = 0; i < inputs_number; ++i)
+                inputs[i].visited_by_route = -1;
+            struct queue_t queue;
+            queue_reset(&queue);
+            for (int input_idx = 0; input_idx < circuit_inputs_number; ++input_idx) {
+                int node = input_idx;
+                int reached_circuit_output_gate = 0;
+                do {
+                    inputs[node].visited_by_route = input_idx;
+                    int gate_idx = outputs[inputs[node].connection].gate_idx;
+                    //if (outputs[inputs[node].connection].visited_by_route == input_idx) {
+                    //    // POSSIBLE loop detected
+                    //    ------------assert(0);
+                    //}
+                    printf("node %d --> output %d (of gate_idx = %d)\n", node, inputs[node].connection, gate_idx);
+                    if (gate_idx >= 0) {
+                        for (int i = 0; i < gates[gatelist[gate_idx].id].inputs_number; ++i) {
+                            int to_node = gatelist[gate_idx].io_indices[i];
+                            if (inputs[to_node].visited_by_route == -1) {
+                                queue_push(&queue, to_node);
+                            } else if (inputs[to_node].visited_by_route != input_idx) {
+                                printf("skipped node %d (from %d), already visited by route %d, current route %d\n", to_node, node, inputs[to_node].visited_by_route, input_idx);
+                                reached_circuit_output_gate = 1;
+                            } else {
+                                printf("loop detected to node %d (from %d), already visited in route %d\n", to_node, node, input_idx);
+                                fflush(stdout);
+                                // loop detected
+                                //assert(0);
+                                goto _big_break;
+                            }
+                        }
+                    } else
+                        reached_circuit_output_gate = 1;
+                } while (queue_pop(&queue, &node));
+                assert(reached_circuit_output_gate);
+            }
+            _big_break:;
+        }
+
         ++total_graphs_number;
         //if (total_graphs_number == 200000) break;
 
@@ -145,18 +268,12 @@ static void do_devlist(enum device_id_t *devlist, int devices_number, int circui
                 ++inputs[i].connection;
                 if (inputs[i].connection == outputs_number) {
                     if (!options.enable_symmetric_relaxation) {
-                        // connect to output[0]
                         inputs[i].connection = 0;
                     } else {
-                        if (inputs[i].gate_idx == inputs[i + 1].gate_idx && inputs[i + 1].connection + 1 != outputs_number && gates[gatelist[inputs[i].gate_idx]].is_symmetric) {
+                        if (inputs[i].gate_idx == inputs[i + 1].gate_idx && inputs[i + 1].connection + 1 != outputs_number && gates[gatelist[inputs[i].gate_idx].id].is_symmetric)
                             inputs[i].connection = inputs[i + 1].connection + 1;
-                        } else {
+                        else
                             inputs[i].connection = 0;
-                            //if (i-1 >= circuit_inputs_number && inputs[i-1].connection == outputs_number) {
-                            //    for (int j = i-1; j >= 0 && inputs[j].gate_idx == inputs[i].gate_idx; --j)
-                            //        inputs[j].connection = 0;
-                            //}
-                        }
                     }
                 } else
                     break;
@@ -173,10 +290,10 @@ static void do_devlist(enum device_id_t *devlist, int devices_number, int circui
 int main() {
     int max_devices_number = 1;
     enum device_id_t devlist[max_devices_number + 1];
-    //memset(devlist, 0, (unsigned)(max_devices_number + 1) * sizeof *devlist);
     for (int i = 0; i < max_devices_number; ++i)
         devlist[i] = DEVICE_NONE + 1;
     devlist[max_devices_number] = DEVICE_NONE;
+
     long total_devsets_number_computed = multiset_number(DEVICE_ID_NUMBER - 1, max_devices_number);
     long total_devsets_number = 0;
     for (;;) {
@@ -193,7 +310,7 @@ int main() {
         }
         printf("}\n");
         if (total_devsets_number == 1) {
-            do_devlist(devlist, max_devices_number, 1, 1);
+            do_devlist(devlist, max_devices_number, 2, 1);
             return 0;
         }
         ++total_devsets_number;
