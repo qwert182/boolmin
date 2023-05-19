@@ -1,7 +1,12 @@
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <memory.h>
+#include <string.h>
+#include <ctype.h>
 #include <assert.h>
+#include <unistd.h>
+#include <dlfcn.h>
 
 #include "boolmin.h"
 
@@ -19,6 +24,7 @@ struct input_t {
 
 struct output_t {
     int gate_idx; // index in 'gatelist'
+    int function_formula_index_tmp; // index in 'function_formula_indices_tmp'
 };
 
 struct gatelist_t {
@@ -177,16 +183,6 @@ static void do_devlist(enum device_id_t *devlist, int devices_number, int circui
                 fprintf(f, "    color = lightgrey;\n");
                 fprintf(f, "    node [style=filled, fillcolor=white];\n");
                 fprintf(f, "    edge [style=invis];\n");
-                //for (int j = 0; j < inputs_number; ++j)
-                //    if (inputs[j].gate_idx == i)
-                //        fprintf(f, "    i%d;\n", j);
-                //for (int j = 0; j < outputs_number; ++j)
-                //    if (outputs[j].gate_idx == i) {
-                //        fprintf(f, "    o%d;\n", j);
-                //        for (int k = 0; k < inputs_number; ++k)
-                //            if (inputs[k].gate_idx == i)
-                //                fprintf(f, "    i%d -> o%d;\n", k, j);
-                //    }
                 for (int j = 0; j < gates[gatelist[i].id].inputs_number; ++j)
                     fprintf(f, "    i%d;\n", gatelist[i].io_indices[j]);
                 for (int j = 0; j < gates[gatelist[i].id].outputs_number; ++j)
@@ -203,25 +199,98 @@ static void do_devlist(enum device_id_t *devlist, int devices_number, int circui
         }
 
         {
+            char function_formula_buffer[1000];
+            int function_formula_buffer_len = 0;
+            FILE *source_file = fopen("/tmp/graph.c", "w");
+            fprintf(source_file, "void graph%ld(int *outputs, int *inputs) {\n", total_graphs_number);
+            for (int i = 0; i < circuit_outputs_number; ++i)
+                fprintf(source_file, "\tint o%d = outputs[%d];\n", i, i);
+
+            int input_values[circuit_inputs_number], output_values[circuit_outputs_number];
+
             for (int i = 0; i < inputs_number; ++i)
                 inputs[i].visited_by_route = -1;
+            for (int i = 0; i < outputs_number; ++i)
+                outputs[i].function_formula_index_tmp = -1;
             struct queue_t queue;
             queue_reset(&queue);
             for (int input_idx = 0; input_idx < circuit_inputs_number; ++input_idx) {
+                int function_formula_indices_tmp[10];
+                int function_formula_indices_tmp_len = 0;
+
                 int node = input_idx;
                 int reached_circuit_output_gate = 0;
+
+                function_formula_indices_tmp[function_formula_indices_tmp_len++] = function_formula_buffer_len;
+                function_formula_buffer_len += sprintf(&function_formula_buffer[function_formula_buffer_len],
+                                                       "int i%d = o%d;", node, inputs[node].connection);
+                ++function_formula_buffer_len; // split lines with null character
+
                 do {
                     inputs[node].visited_by_route = input_idx;
                     int gate_idx = outputs[inputs[node].connection].gate_idx;
-                    //if (outputs[inputs[node].connection].visited_by_route == input_idx) {
-                    //    // POSSIBLE loop detected
-                    //    ------------assert(0);
-                    //}
+
                     printf("node %d --> output %d (of gate_idx = %d)\n", node, inputs[node].connection, gate_idx);
                     if (gate_idx >= 0) {
+                        int output_visited = 0;
+                        if (outputs[inputs[node].connection].function_formula_index_tmp >= 0) {
+                            output_visited = 1;
+                            //function_formula_indices_tmp[function_formula_indices_tmp_len++] = function_formula_indices_tmp[outputs[inputs[node].connection].function_formula_index_tmp];
+                            //function_formula_indices_tmp[outputs[inputs[node].connection].function_formula_index_tmp] = -1;
+                        } else {
+                            outputs[inputs[node].connection].function_formula_index_tmp = function_formula_indices_tmp_len;
+                            function_formula_indices_tmp[function_formula_indices_tmp_len++] = function_formula_buffer_len;
+                            function_formula_buffer_len += sprintf(&function_formula_buffer[function_formula_buffer_len],
+                                                                   "int ");
+                            const char *formula = gates[gatelist[gate_idx].id].formula;
+                            for (int i = 0, word_start = -1;; ++i) {
+                                if (isalnum(formula[i])) {
+                                    if (word_start < 0)
+                                        word_start = i;
+                                } else {
+                                    if (word_start >= 0) {
+                                        char io_char;
+                                        int io_number;
+                                        assert(sscanf(&formula[word_start], "%c%d", &io_char, &io_number) == 2);
+                                        //printf("{%.*s}", i - word_start, &formula[word_start]);
+                                        if (io_char == 'i') {
+                                            assert(0 <= io_number - 1 && io_number - 1 < gates[gatelist[gate_idx].id].inputs_number);
+                                            function_formula_buffer_len += sprintf(&function_formula_buffer[function_formula_buffer_len],
+                                                                                   "i%d", gatelist[gate_idx].io_indices[io_number - 1]);
+                                        } else if (io_char == 'o') {
+                                            function_formula_buffer_len += sprintf(&function_formula_buffer[function_formula_buffer_len],
+                                                                                   "o%d", inputs[node].connection);
+                                        } else {
+                                            assert(io_char == 'i' || io_char == 'o');
+                                        }
+                                        word_start = -1;
+                                    }
+                                    if (formula[i] != '\0')
+                                        function_formula_buffer[function_formula_buffer_len++] = formula[i];
+                                    else
+                                        break;
+                                }
+                            }
+
+                            function_formula_buffer_len += sprintf(&function_formula_buffer[function_formula_buffer_len],
+                                                                   ";");
+                            ++function_formula_buffer_len; // split lines with null character
+
+                            //assert(new_formula_len <= LENGTH(new_formula));
+                            //--new_formula_len;
+                            //assert(new_formula_len == strlen(new_formula));
+                            //printf("===> int %s;\n", new_formula);
+                        }
+
                         for (int i = 0; i < gates[gatelist[gate_idx].id].inputs_number; ++i) {
                             int to_node = gatelist[gate_idx].io_indices[i];
-                            if (inputs[to_node].visited_by_route == -1) {
+                            if (inputs[to_node].visited_by_route < 0) {
+                                if (!output_visited) {
+                                    function_formula_indices_tmp[function_formula_indices_tmp_len++] = function_formula_buffer_len;
+                                    function_formula_buffer_len += sprintf(&function_formula_buffer[function_formula_buffer_len],
+                                                                           "int i%d = o%d;", to_node, inputs[to_node].connection);
+                                    ++function_formula_buffer_len; // split lines with null character
+                                }
                                 queue_push(&queue, to_node);
                             } else if (inputs[to_node].visited_by_route != input_idx) {
                                 printf("skipped node %d (from %d), already visited by route %d, current route %d\n", to_node, node, inputs[to_node].visited_by_route, input_idx);
@@ -230,19 +299,64 @@ static void do_devlist(enum device_id_t *devlist, int devices_number, int circui
                                 printf("loop detected to node %d (from %d), already visited in route %d\n", to_node, node, input_idx);
                                 fflush(stdout);
                                 // loop detected
-                                //assert(0);
-                                goto _big_break;
+                                goto skip_graph;
                             }
                         }
                     } else
                         reached_circuit_output_gate = 1;
                 } while (queue_pop(&queue, &node));
                 assert(reached_circuit_output_gate);
+                assert(function_formula_indices_tmp_len <= LENGTH(function_formula_indices_tmp));
+                assert(function_formula_buffer_len <= LENGTH(function_formula_buffer));
+                for (int i = function_formula_indices_tmp_len - 1; i >= 0; --i) {
+                    if (function_formula_indices_tmp[i] >= 0) {
+                        printf(" ==> %s\n", &function_formula_buffer[function_formula_indices_tmp[i]]);
+                        fprintf(source_file, "\t%s\n", &function_formula_buffer[function_formula_indices_tmp[i]]);
+                    }
+                }
             }
-            _big_break:;
+            for (int i = 0; i < circuit_inputs_number; ++i)
+                fprintf(source_file, "\tinputs[%d] = (char)i%d;\n", i, i);
+            fprintf(source_file, "}\n");
+            fclose(source_file);
+            int err = system("cd /tmp && gcc -O2 -Wall -Wextra -Wconversion -Werror -shared -o graph.so graph.c");
+            if (err) {
+                fprintf(stderr, "ERROR: compiler failed\n");
+                exit(1);
+            }
+            void *dll = dlopen("/tmp/graph.so", RTLD_LOCAL | RTLD_LAZY);
+            char funcname[16];
+            sprintf(funcname, "graph%ld", total_graphs_number);
+            void (*func)(int *outputs, int *inputs) = (void (*)(int*,int*))dlsym(dll, funcname);
+            memset(output_values, 0, circuit_outputs_number * sizeof *output_values);
+            int i;
+            do {
+                for (i = 0; i < circuit_outputs_number; ++i)
+                    printf(i == 0 ? "%d" : " %d", output_values[i]);
+                printf(" -> ");
+                func(output_values, input_values);
+                for (i = 0; i < circuit_inputs_number; ++i)
+                    printf(i == 0 ? "%d" : " %d", input_values[i]);
+                printf("\n");
+                for (i = 0; i < circuit_outputs_number; ++i) {
+                    if (output_values[i] == 0) {
+                        ++output_values[i];
+                        break;
+                    }
+                    output_values[i] = 0;
+                }
+            } while (i != circuit_outputs_number);
+            dlclose(dll);
+            unlink("/tmp/graph.so");
+            goto next_graph;
+
+  skip_graph:
+            fclose(source_file);
+  next_graph:;
         }
 
         ++total_graphs_number;
+        printf("\n");
         //if (total_graphs_number == 200000) break;
 
         int i = 0;

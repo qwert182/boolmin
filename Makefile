@@ -1,6 +1,7 @@
 PROJECT_ROOT = $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-OBJS = boolmin.o
+OBJS := boolmin.o
+LIBS := -ldl
 
 ifeq ($(BUILD_MODE),debug)
 	CFLAGS += -g
@@ -19,7 +20,7 @@ endif
 all:	boolmin
 
 boolmin:	$(OBJS)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 	$(EXTRA_CMDS)
 
 %.o:	$(PROJECT_ROOT)%.c $(PROJECT_ROOT)Makefile $(PROJECT_ROOT)*.h
